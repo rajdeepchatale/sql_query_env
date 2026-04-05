@@ -1,0 +1,144 @@
+spec_version: 1
+name: sql_query_env
+description: >
+  Trains agents to generate SQL queries from natural language questions.
+  Tests across three database domains (company analytics, hospital
+  management, e-commerce) with efficiency scoring and diagnostic feedback.
+type: space
+runtime: fastapi
+app: server.app:app
+port: 8000
+
+tasks:
+  # Company
+  - id: company_easy_1
+    name: "Company — Engineering Employees"
+    difficulty: easy
+    description: "List active Engineering employees sorted by salary"
+    domain: company
+
+  - id: company_easy_2
+    name: "Company — Electronics Products"
+    difficulty: easy
+    description: "Filter electronics products by price"
+    domain: company
+
+  - id: company_medium_1
+    name: "Company — Revenue by Category"
+    difficulty: medium
+    description: "Total revenue per product category for completed orders"
+    domain: company
+
+  - id: company_medium_2
+    name: "Company — Department Salaries"
+    difficulty: medium
+    description: "Departments with average salary exceeding $100K"
+    domain: company
+
+  - id: company_hard_1
+    name: "Company — Budget Utilization"
+    difficulty: hard
+    description: "Department salary-to-budget utilization percentage"
+    domain: company
+
+  # Hospital
+  - id: hospital_easy_1
+    name: "Hospital — Current Patients"
+    difficulty: easy
+    description: "List patients still admitted (NULL discharge date)"
+    domain: hospital
+
+  - id: hospital_medium_1
+    name: "Hospital — Medication Costs"
+    difficulty: medium
+    description: "Total medication cost for admitted patients"
+    domain: hospital
+
+  - id: hospital_hard_1
+    name: "Hospital — Cross-Ward Prescriptions"
+    difficulty: hard
+    description: "Doctors prescribing to patients outside their ward"
+    domain: hospital
+
+  # E-Commerce
+  - id: ecommerce_easy_1
+    name: "E-Commerce — Premium Users"
+    difficulty: easy
+    description: "List premium users with signup details"
+    domain: ecommerce
+
+  - id: ecommerce_medium_1
+    name: "E-Commerce — Seller Revenue"
+    difficulty: medium
+    description: "Revenue per seller for delivered orders"
+    domain: ecommerce
+
+  - id: ecommerce_hard_1
+    name: "E-Commerce — Return Rate Analysis"
+    difficulty: hard
+    description: "Return rate per product category with edge cases"
+    domain: ecommerce
+
+  # Expert-level
+  - id: company_hard_2
+    name: "Company — Salary vs Manager"
+    difficulty: hard
+    description: "Employees earning more than their direct manager (self-join)"
+    domain: company
+
+  - id: hospital_hard_2
+    name: "Hospital — Repeat Visits"
+    difficulty: hard
+    description: "Patients with multiple appointments with the same doctor"
+    domain: hospital
+
+  - id: ecommerce_hard_2
+    name: "E-Commerce — Dead Stock"
+    difficulty: hard
+    description: "In-stock products that have never been ordered (anti-join)"
+    domain: ecommerce
+
+action_space:
+  type: object
+  properties:
+    query:
+      type: string
+      description: "SQL SELECT query to execute against the database"
+
+observation_space:
+  type: object
+  properties:
+    task_id:
+      type: string
+    difficulty:
+      type: string
+      enum: [easy, medium, hard]
+    database_domain:
+      type: string
+      description: "Company Analytics, Hospital Management, or E-Commerce Platform"
+    question:
+      type: string
+    schema_description:
+      type: string
+    query_result:
+      type: string
+    query_error:
+      type: string
+    feedback:
+      type: string
+    diagnostics:
+      type: array
+      description: "Structured diagnostic feedback (type, severity, message, suggestion)"
+    efficiency_notes:
+      type: array
+      description: "SQL efficiency and best-practice feedback"
+    expected_row_count:
+      type: integer
+    expected_columns:
+      type: array
+    steps_remaining:
+      type: integer
+    current_score:
+      type: number
+    history:
+      type: array

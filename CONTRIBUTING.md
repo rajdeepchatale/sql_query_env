@@ -1,6 +1,6 @@
 # Development Notes
 
-Quick reference for our team on how to work on this project.
+Thanks for checking out the codebase! I built this specifically for the Meta OpenEnv Hackathon 2026. If you want to run my local testing suite or add more SQL tasks later, here is my setup process.
 
 ## Setup
 

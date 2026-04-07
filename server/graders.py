@@ -1,16 +1,15 @@
 """
 Grading logic for SQL queries.
 
-The scoring is split into five components instead of a binary pass/fail.
-We found during testing that a query referencing the right tables but
-messing up column names should still get partial credit — otherwise the
-agent gets zero signal on almost-correct attempts and can't learn.
+I split the scoring into five isolated components instead of a standard binary pass/fail.
+I found during early local testing that if an agent referenced the correct tables but
+messed up an aggregate column name, binary scoring gave it zero signal, and it couldn't learn.
 
-Score weights were chosen by trial and error:
+Score weights were chosen through extensive trial and error on my end:
   syntax=0.10, tables=0.15, columns=0.20, results=0.45, efficiency=0.10
 
-A query needs to be mostly correct to break 0.70 but you always get
-*something* for partial progress.
+I designed this so a query needs to be mostly correct to break 0.70, but the agent
+will always retain *some* partial progress.
 """
 
 import re

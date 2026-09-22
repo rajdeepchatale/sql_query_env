@@ -2,17 +2,13 @@
 Core environment logic for the SQL query environment.
 
 Each episode creates a fresh in-memory SQLite database for the chosen
-domain so there's no state leaking between episodes. SQLite in-memory
-databases are cheap to spin up so this doesn't hurt performance.
-
-TODO(team): might want to add a "curriculum mode" that auto-selects
-tasks of increasing difficulty within a session. For now we just let
-the caller pick or we cycle through randomly.
+domain, so no state leaks between episodes. The database is read-only once
+seeded, and in-memory SQLite databases are cheap enough to build per episode.
 """
 
 import random
 import sqlite3
-from typing import Dict, List, Optional
+from typing import List, Optional
 from uuid import uuid4
 
 from openenv.core.env_server.interfaces import Environment
@@ -26,8 +22,8 @@ except ImportError:
     from models import SqlQueryAction, SqlQueryObservation
 
 try:
+    from .graders import grade_query
     from .tasks import (
-        ALL_TASKS,
         ALL_TASKS_LIST,
         SCHEMAS,
         TASK_MAP,
@@ -35,10 +31,9 @@ try:
         create_database,
         get_expected_result,
     )
-    from .graders import grade_query, GradeResult
 except ImportError:
+    from server.graders import grade_query
     from server.tasks import (
-        ALL_TASKS,
         ALL_TASKS_LIST,
         SCHEMAS,
         TASK_MAP,
@@ -46,15 +41,17 @@ except ImportError:
         create_database,
         get_expected_result,
     )
-    from server.graders import grade_query, GradeResult
 
 
 class SqlQueryEnvironment(Environment):
     """Main environment class - presents schema + question, grades SQL.
 
-    Steps are independent in terms of DB state (no writes accumulate).
-    We track query history and best score across steps for penalty logic
-    and progressive hints.
+    ``reset(task_id=...)`` selects a specific task; without one, tasks are
+    served from a shuffled queue that cycles through all tasks (pass
+    ``seed`` for a reproducible order). The episode ends when the query's
+    result matches the reference exactly or the task's attempt budget runs
+    out. Query history and best score are tracked across steps for the
+    repeated-query penalty and progressive hints.
     """
 
     SUPPORTS_CONCURRENT_SESSIONS: bool = True
@@ -64,26 +61,27 @@ class SqlQueryEnvironment(Environment):
         self._db: Optional[sqlite3.Connection] = None
         self._current_task: Optional[Task] = None
         self._current_schema_id: Optional[str] = None
+        self._expected_row_count: int = 0
         self._previous_queries: List[str] = []
         self._best_score: float = 0.0
         self._step_rewards: List[float] = []
+        self._rng = random.Random()
         self._task_queue: List[str] = []
         self._current_task_index: int = 0
 
-    def _get_task_list(self) -> List[str]:
-        """Shuffle task IDs for random ordering."""
-        all_ids = [t.id for t in ALL_TASKS_LIST]
-        random.shuffle(all_ids)
-        return all_ids
-
     def _select_task(self, task_id: Optional[str] = None) -> Task:
-        """Pick a specific task or grab the next one from the queue."""
-        if task_id and task_id in TASK_MAP:
+        """Pick a specific task or grab the next one from the shuffled queue."""
+        if task_id is not None:
+            if task_id not in TASK_MAP:
+                raise ValueError(
+                    f"Unknown task_id {task_id!r}. Valid ids: {', '.join(sorted(TASK_MAP))}"
+                )
             return TASK_MAP[task_id]
 
         # lazy-init the queue
         if not self._task_queue:
-            self._task_queue = self._get_task_list()
+            self._task_queue = [t.id for t in ALL_TASKS_LIST]
+            self._rng.shuffle(self._task_queue)
             self._current_task_index = 0
 
         if self._current_task_index >= len(self._task_queue):
@@ -93,13 +91,28 @@ class SqlQueryEnvironment(Environment):
         self._current_task_index += 1
         return task
 
-    def reset(self, task_id: Optional[str] = None) -> SqlQueryObservation:
+    def reset(
+        self,
+        seed: Optional[int] = None,
+        episode_id: Optional[str] = None,
+        task_id: Optional[str] = None,
+        **kwargs,
+    ) -> SqlQueryObservation:
         """Start a new episode.
 
+        Args:
+            seed: Reseeds the task queue so un-targeted resets are reproducible.
+            episode_id: Optional custom episode identifier.
+            task_id: Run a specific task (see ``openenv.yaml`` for ids).
+
         Creates a fresh DB for the task's domain and returns the initial
-        observation with schema, question, and hints.
+        observation with schema, question, and the first hint.
         """
-        self._state = State(episode_id=str(uuid4()), step_count=0)
+        if seed is not None:
+            self._rng.seed(seed)
+            self._task_queue = []
+
+        self._state = State(episode_id=episode_id or str(uuid4()), step_count=0)
         self._previous_queries = []
         self._best_score = 0.0
         self._step_rewards = []
@@ -116,7 +129,9 @@ class SqlQueryEnvironment(Environment):
         self._db = create_database(self._current_schema_id)
 
         schema = SCHEMAS[self._current_schema_id]
-        expected_rows = get_expected_result(self._db, self._current_task.ground_truth_query)
+        self._expected_row_count = len(
+            get_expected_result(self._db, self._current_task.ground_truth_query)
+        )
 
         return SqlQueryObservation(
             task_id=self._current_task.id,
@@ -135,7 +150,7 @@ class SqlQueryEnvironment(Environment):
             ),
             diagnostics=[],
             efficiency_notes=[],
-            expected_row_count=len(expected_rows),
+            expected_row_count=self._expected_row_count,
             expected_columns=self._current_task.expected_columns,
             steps_remaining=self._current_task.max_steps,
             current_score=0.0,
@@ -165,7 +180,12 @@ class SqlQueryEnvironment(Environment):
             return ""
         return "\n".join(f"  - {h}" for h in shown)
 
-    def step(self, action: SqlQueryAction) -> SqlQueryObservation:
+    def step(
+        self,
+        action: SqlQueryAction,
+        timeout_s: Optional[float] = None,
+        **kwargs,
+    ) -> SqlQueryObservation:
         """Evaluate a submitted SQL query and return graded feedback."""
         if self._current_task is None or self._db is None:
             return SqlQueryObservation(
@@ -190,8 +210,8 @@ class SqlQueryEnvironment(Environment):
         self._step_rewards.append(grade_result.total_score)
         self._best_score = max(self._best_score, grade_result.total_score)
 
-        # done if near-perfect or out of steps
-        is_done = grade_result.total_score >= 0.95 or steps_remaining <= 0
+        # done if the result is exactly right or out of attempts
+        is_done = grade_result.is_correct or steps_remaining <= 0
 
         # build history for the observation
         history = [
@@ -201,26 +221,25 @@ class SqlQueryEnvironment(Environment):
                 "score": round(s, 2),
             }
             for i, (q, s) in enumerate(
-                zip(self._previous_queries, self._step_rewards)
+                zip(self._previous_queries, self._step_rewards, strict=True)
             )
         ]
 
         feedback = grade_result.feedback
 
         # add hints if the agent is struggling
-        if not is_done and grade_result.total_score < 0.95:
+        if not is_done:
             hint_text = self._progressive_hints(step)
             if hint_text:
                 feedback += f"\n\nHints (attempt {step}):\n{hint_text}"
 
         if is_done:
-            if grade_result.total_score >= 0.95:
-                feedback += "\n\nNear-perfect score achieved."
+            if grade_result.is_correct:
+                feedback += "\n\nCorrect: the result set matches the expected output."
             else:
                 feedback += f"\n\nEpisode finished. Best score: {self._best_score:.2f}"
             feedback += f"\nScore progression: {' -> '.join(f'{s:.2f}' for s in self._step_rewards)}"
 
-        expected_rows = get_expected_result(self._db, self._current_task.ground_truth_query)
         schema = SCHEMAS[self._current_schema_id]
 
         return SqlQueryObservation(
@@ -234,7 +253,7 @@ class SqlQueryEnvironment(Environment):
             feedback=feedback,
             diagnostics=[d.to_dict() for d in grade_result.diagnostics],
             efficiency_notes=grade_result.efficiency_notes,
-            expected_row_count=len(expected_rows),
+            expected_row_count=self._expected_row_count,
             expected_columns=self._current_task.expected_columns,
             steps_remaining=max(0, steps_remaining),
             current_score=self._best_score,
@@ -247,6 +266,7 @@ class SqlQueryEnvironment(Environment):
                 "database_domain": self._current_schema_id,
                 "step": step,
                 "best_score": self._best_score,
+                "is_correct": grade_result.is_correct,
                 "syntax_score": grade_result.syntax_score,
                 "table_score": grade_result.table_score,
                 "column_score": grade_result.column_score,

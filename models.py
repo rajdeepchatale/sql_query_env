@@ -1,10 +1,9 @@
 """
 Pydantic models for the SQL environment's action/observation space.
 
-We tried keeping the observation minimal at first but realized the agent
-needs way more context to actually improve between steps - so we added
-diagnostics, efficiency notes, history etc. Bit of a chonky payload but
-it's all text so doesn't matter much for perf.
+The observation is deliberately rich: besides the score, it carries the
+query result, structured diagnostics, style notes, and the attempt history,
+so an agent has what it needs to improve its query between steps.
 """
 
 from typing import Dict, List, Optional
@@ -24,18 +23,17 @@ class SqlQueryAction(Action):
 
 class SqlQueryObservation(Observation):
     """
-    Full observation returned after each step.
+    Full observation returned by ``reset()`` and after each step.
 
-    We pack a lot in here because the agent needs to understand what went
-    wrong and how to fix it. The alternative was returning just a score,
-    but that gives basically zero learning signal.
+    A bare score says that a query is wrong but not why; the diagnostics and
+    feedback fields say what to change on the next attempt.
     """
 
     # task context
     task_id: str = Field(default="", description="Current task identifier")
     difficulty: str = Field(default="easy", description="easy, medium, or hard")
     database_domain: str = Field(
-        default="company", description="Which database domain this task uses"
+        default="", description="Which database domain this task uses"
     )
     question: str = Field(default="", description="Natural language question to answer with SQL")
     schema_description: str = Field(
@@ -47,7 +45,7 @@ class SqlQueryObservation(Observation):
     query_error: Optional[str] = Field(default=None, description="SQL error message, if any")
     feedback: str = Field(default="", description="Detailed grading feedback")
 
-    # structured diagnostics - these are the key differentiator
+    # structured, machine-readable feedback for process supervision
     diagnostics: List[Dict] = Field(
         default_factory=list,
         description="Structured error diagnostics: type, severity, message, suggestion",

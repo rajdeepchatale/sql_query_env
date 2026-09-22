@@ -1,17 +1,25 @@
 """
 Baseline inference script for the SQL Query Environment.
 
-Runs Qwen-72B across all task domains and difficulty levels,
-printing results in the [START]/[STEP]/[END] format required
-by the OpenEnv evaluation pipeline.
+Runs an OpenAI-compatible chat model (default: Qwen2.5-72B-Instruct via the
+Hugging Face router) on every task, printing results in the
+[START]/[STEP]/[END] format required by the OpenEnv evaluation pipeline.
 
 Usage:
     export HF_TOKEN="your-token"
-    python inference.py
+    uv run python inference.py
+
+Environment variables:
+    HF_TOKEN / API_KEY  API key for the model endpoint (required)
+    API_BASE_URL        OpenAI-compatible endpoint (default: HF router)
+    MODEL_NAME          Model id (default: Qwen/Qwen2.5-72B-Instruct)
+    ENV_BASE_URL        Running environment server (default: http://localhost:8000)
+    IMAGE_NAME          Start the environment from this Docker image instead
 """
 
 import asyncio
 import os
+import sys
 import textwrap
 from typing import List, Optional
 
@@ -31,19 +39,21 @@ MAX_STEPS_PER_TASK = 6
 TEMPERATURE = 0.3
 MAX_TOKENS = 500
 
-# one task from each domain at each difficulty level
+# every task, grouped by difficulty (must match openenv.yaml)
 TASK_IDS = [
     "company_easy_1",
+    "company_easy_2",
     "hospital_easy_1",
     "ecommerce_easy_1",
     "company_medium_1",
+    "company_medium_2",
     "hospital_medium_1",
     "ecommerce_medium_1",
     "company_hard_1",
+    "company_hard_2",      # self-join
     "hospital_hard_1",
-    "ecommerce_hard_1",
-    "company_hard_2",      # self-join challenge
     "hospital_hard_2",     # repeat visits
+    "ecommerce_hard_1",
     "ecommerce_hard_2",    # anti-join / dead stock
 ]
 
@@ -184,7 +194,7 @@ async def run_task(client: OpenAI, env: SqlQueryEnv, task_id: str) -> float:
     log_start(task=task_id, env=BENCHMARK, model=MODEL_NAME)
 
     try:
-        result = await env.reset()
+        result = await env.reset(task_id=task_id)
         obs = result.observation
 
         feedback = obs.feedback
@@ -231,6 +241,8 @@ async def run_task(client: OpenAI, env: SqlQueryEnv, task_id: str) -> float:
 
 async def main() -> None:
     """Run all tasks and print summary."""
+    if not API_KEY:
+        sys.exit("Set HF_TOKEN (or API_KEY) to run the baseline.")
     client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY)
 
     if IMAGE_NAME:
@@ -253,12 +265,12 @@ async def main() -> None:
             print(f"{'='*50}", flush=True)
 
             domains = {"company": [], "hospital": [], "ecommerce": []}
-            for tid, sc in zip(TASK_IDS, scores):
+            for tid, sc in zip(TASK_IDS, scores, strict=True):
                 domain = tid.split("_")[0]
                 domains[domain].append(sc)
                 print(f"  {tid}: {sc:.2f}", flush=True)
 
-            print(f"\nPer-domain averages:", flush=True)
+            print("\nPer-domain averages:", flush=True)
             for domain, dscores in domains.items():
                 avg = sum(dscores) / len(dscores) if dscores else 0
                 print(f"  {domain}: {avg:.2f}", flush=True)

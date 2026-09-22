@@ -1,16 +1,18 @@
 spec_version: 1
 name: sql_query_env
 description: >
-  Trains agents to generate SQL queries from natural language questions.
-  Tests across three database domains (company analytics, hospital
-  management, e-commerce) with efficiency scoring and diagnostic feedback.
+  Text-to-SQL environment: the agent receives a database schema and a
+  natural-language question, submits SQLite SELECT queries, and is rewarded
+  by executing them against a read-only database. Three domains (company
+  analytics, hospital management, e-commerce), 14 tasks, partial-credit
+  scoring, and structured diagnostic feedback.
 type: space
 runtime: fastapi
 app: server.app:app
 port: 8000
 
 tasks:
-  # Company
+  # Company Analytics
   - id: company_easy_1
     name: "Company — Engineering Employees"
     difficulty: easy
@@ -32,7 +34,7 @@ tasks:
   - id: company_medium_2
     name: "Company — Department Salaries"
     difficulty: medium
-    description: "Departments with average salary exceeding $100K"
+    description: "Departments whose active employees average more than $100K"
     domain: company
 
   - id: company_hard_1
@@ -41,7 +43,13 @@ tasks:
     description: "Department salary-to-budget utilization percentage"
     domain: company
 
-  # Hospital
+  - id: company_hard_2
+    name: "Company — Salary vs Manager"
+    difficulty: hard
+    description: "Employees earning more than their direct manager (self-join)"
+    domain: company
+
+  # Hospital Management
   - id: hospital_easy_1
     name: "Hospital — Current Patients"
     difficulty: easy
@@ -60,7 +68,13 @@ tasks:
     description: "Doctors prescribing to patients outside their ward"
     domain: hospital
 
-  # E-Commerce
+  - id: hospital_hard_2
+    name: "Hospital — Repeat Visits"
+    difficulty: hard
+    description: "Patients with multiple appointments with the same doctor"
+    domain: hospital
+
+  # E-Commerce Platform
   - id: ecommerce_easy_1
     name: "E-Commerce — Premium Users"
     difficulty: easy
@@ -79,19 +93,6 @@ tasks:
     description: "Return rate per product category with edge cases"
     domain: ecommerce
 
-  # Expert-level
-  - id: company_hard_2
-    name: "Company — Salary vs Manager"
-    difficulty: hard
-    description: "Employees earning more than their direct manager (self-join)"
-    domain: company
-
-  - id: hospital_hard_2
-    name: "Hospital — Repeat Visits"
-    difficulty: hard
-    description: "Patients with multiple appointments with the same doctor"
-    domain: hospital
-
   - id: ecommerce_hard_2
     name: "E-Commerce — Dead Stock"
     difficulty: hard
@@ -103,7 +104,7 @@ action_space:
   properties:
     query:
       type: string
-      description: "SQL SELECT query to execute against the database"
+      description: "A single SQLite SELECT statement (WITH ... SELECT allowed)"
 
 observation_space:
   type: object
@@ -123,7 +124,7 @@ observation_space:
     query_result:
       type: string
     query_error:
-      type: string
+      type: [string, "null"]
     feedback:
       type: string
     diagnostics:

@@ -1,21 +1,38 @@
 [build-system]
-requires = ["setuptools>=45", "wheel"]
+requires = ["setuptools>=77", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "openenv-sql_query_env"
-version = "0.1.0"
-description = "SQL query generation environment for OpenEnv"
+version = "0.2.0"
+description = "OpenEnv reinforcement-learning environment for text-to-SQL with execution-based, partial-credit rewards"
+readme = "README.md"
+license = "BSD-3-Clause"
+license-files = ["LICENSE"]
+authors = [{ name = "Rajdeep Chatale" }]
 requires-python = ">=3.10"
+keywords = ["openenv", "reinforcement-learning", "text-to-sql", "llm", "sqlite", "benchmark"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Database",
+]
 dependencies = [
     "openenv-core[core]>=0.2.2",
+    "openai>=1.0.0",  # used by inference.py
 ]
 
 [project.optional-dependencies]
 dev = [
     "pytest>=8.0.0",
     "pytest-cov>=4.0.0",
+    "pyyaml>=6.0",
+    "ruff>=0.5.0",
 ]
+
+[project.urls]
+Repository = "https://github.com/rajdeepchatale/sql_query_env"
+"Hugging Face Space" = "https://huggingface.co/spaces/rajdeepchatale/sql_query_env"
 
 [project.scripts]
 server = "sql_query_env.server.app:main"
@@ -24,3 +41,19 @@ server = "sql_query_env.server.app:main"
 include-package-data = true
 packages = ["sql_query_env", "sql_query_env.server"]
 package-dir = { "sql_query_env" = ".", "sql_query_env.server" = "server" }
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+# the repo root is itself the package (OpenEnv layout), so avoid rootdir-relative imports
+addopts = "--import-mode=importlib"
+
+[tool.ruff]
+target-version = "py310"
+
+[tool.ruff.lint]
+# explicit rule set so CI doesn't change with ruff's evolving defaults
+select = ["E4", "E7", "E9", "F", "I", "B"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["sql_query_env"]

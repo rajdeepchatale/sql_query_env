@@ -1,8 +1,6 @@
-# Multi-stage build using openenv-base
-# This Dockerfile is flexible and works for both:
-# - In-repo environments (with local OpenEnv sources)
-# - Standalone environments (with openenv from PyPI/Git)
-# The build script (openenv build) handles context detection and sets appropriate build args.
+# Multi-stage build on the OpenEnv base image.
+# Used by Hugging Face Spaces (Docker SDK), `docker build .`, and `openenv build`
+# (which passes BUILD_MODE / ENV_NAME as build args).
 
 ARG BASE_IMAGE=ghcr.io/meta-pytorch/openenv-base:latest
 FROM ${BASE_IMAGE} AS builder
@@ -31,9 +29,9 @@ RUN if ! command -v uv >/dev/null 2>&1; then \
         mv /root/.local/bin/uv /usr/local/bin/uv && \
         mv /root/.local/bin/uvx /usr/local/bin/uvx; \
     fi
-    
-# Install dependencies using uv sync
-# If uv.lock exists, use it; otherwise resolve on the fly
+
+# Install dependencies from the committed lockfile (falls back to resolving
+# on the fly if uv.lock is absent)
 RUN --mount=type=cache,target=/root/.cache/uv \
     if [ -f uv.lock ]; then \
         uv sync --frozen --no-install-project --no-editable; \

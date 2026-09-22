@@ -1,22 +1,21 @@
 """
 Database schemas, seed data, and task definitions.
 
-Three separate database domains so the agent can't just memorize one
-schema. We experimented with more domains but three felt like the sweet
-spot for coverage without making the task set unmanageable.
+Tasks span three independent database domains so an agent has to read the
+schema it is given rather than memorize a single layout.
 
-Seed data is intentionally small (~10-15 rows per table). Bigger datasets
-would be more realistic but for an RL environment the grading speed matters
-more. We can always scale up the data later if needed.
+Seed data is intentionally small (3-24 rows per table): grading runs
+the reference query on every step, so small tables keep episodes fast while
+still containing the edge cases the tasks depend on (NULLs, inactive rows,
+cancelled orders, rows with no matches).
 
-NOTE: if you add a new task, make sure to also add it to the openenv.yaml
-manifest and update the TASK_IDS list in inference.py.
+When adding a task, also add it to ``openenv.yaml`` and to ``TASK_IDS`` in
+``inference.py``; ``tests/test_tasks.py`` fails if the three drift apart.
 """
 
 import sqlite3
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
-
+from typing import Dict, List, Tuple
 
 # ---------------------------------------------------------------------------
 # Data structures
@@ -44,7 +43,7 @@ class Task:
     description: str = ""
     hints: List[str] = field(default_factory=list)
     max_steps: int = 5
-    challenge_type: str = ""  # e.g., "ambiguous", "temporal", "efficiency"
+    challenge_type: str = ""  # e.g. "null_handling", "self_join", "anti_join"
 
 
 # ---------------------------------------------------------------------------
@@ -639,13 +638,34 @@ SCHEMAS: Dict[str, DatabaseSchema] = {
 }
 
 
+# Authorizer action codes a plain SELECT needs. Everything else (writes,
+# schema changes, PRAGMA, ATTACH, transactions) is denied. SQLITE_RECURSIVE
+# (33) is needed for recursive CTEs; the constant only exists on Python 3.11+.
+_READ_ONLY_ACTIONS = frozenset({
+    sqlite3.SQLITE_SELECT,
+    sqlite3.SQLITE_READ,
+    sqlite3.SQLITE_FUNCTION,
+    getattr(sqlite3, "SQLITE_RECURSIVE", 33),
+})
+
+
+def _read_only_authorizer(action: int, *_args) -> int:
+    return sqlite3.SQLITE_OK if action in _READ_ONLY_ACTIONS else sqlite3.SQLITE_DENY
+
+
 def create_database(schema_id: str = "company") -> sqlite3.Connection:
-    """Create an in-memory SQLite database for a specific domain."""
+    """Create a seeded, read-only in-memory SQLite database for a domain.
+
+    The authorizer is installed after seeding, so every statement the agent
+    submits is compiled against it: anything other than a read is rejected
+    by SQLite before it runs, and the episode's data cannot be modified.
+    """
     schema = SCHEMAS[schema_id]
     conn = sqlite3.connect(":memory:", check_same_thread=False)
     conn.execute("PRAGMA foreign_keys = ON")
     conn.executescript(schema.schema_sql)
     conn.executescript(schema.seed_sql)
+    conn.set_authorizer(_read_only_authorizer)
     return conn
 
 
@@ -653,12 +673,6 @@ def get_expected_result(conn: sqlite3.Connection, query: str) -> List[Tuple]:
     """Execute a query and return the result set."""
     cursor = conn.execute(query)
     return cursor.fetchall()
-
-
-def get_column_names(conn: sqlite3.Connection, query: str) -> List[str]:
-    """Get column names from a query result."""
-    cursor = conn.execute(query)
-    return [desc[0] for desc in cursor.description] if cursor.description else []
 
 
 # ---------------------------------------------------------------------------
@@ -723,7 +737,7 @@ COMPANY_TASKS = [
         id="company_medium_2",
         difficulty="medium",
         schema_id="company",
-        question="Find the average salary per department, but only show departments where the average salary exceeds $100,000. Show department name and average salary, sorted by average salary descending.",
+        question="Considering only active employees, find the average salary per department, but only show departments where that average exceeds $100,000. Show department name and average salary, sorted by average salary descending.",
         ground_truth_query="""
             SELECT d.name, AVG(e.salary) AS avg_salary
             FROM employees e
@@ -842,7 +856,7 @@ HOSPITAL_TASKS = [
             ORDER BY d.name
         """,
         expected_columns=["doctor_name", "doctor_ward", "patient_name", "patient_ward", "medication"],
-        description="Cross-ward prescription analysis — 5-table JOIN with self-referencing comparison",
+        description="Cross-ward prescription analysis — 5-table JOIN with the wards table joined twice",
         hints=[
             "Join prescriptions with doctors, patients, medications, and wards (twice!)",
             "Join wards once for doctor's ward and once for patient's ward",
@@ -909,7 +923,7 @@ ECOMMERCE_TASKS = [
         id="ecommerce_hard_1",
         difficulty="hard",
         schema_id="ecommerce",
-        question="Calculate the return rate for each product category. Show the category name, total items sold (from delivered orders), total items returned, and the return rate as a percentage (rounded to 1 decimal). Include categories with zero returns. Sort by return rate descending.",
+        question="Calculate the return rate for each product category that has delivered sales. Show the category name, total items sold (sum of quantities from delivered orders), total items returned (the number of return records for the category, regardless of order or return status), and the return rate as a percentage (returned / sold * 100, rounded to 1 decimal). Include categories with zero returns. Sort by return rate descending.",
         ground_truth_query="""
             SELECT
                 c.name AS category,
@@ -951,7 +965,7 @@ ECOMMERCE_TASKS = [
 
 
 # ---------------------------------------------------------------------------
-# Expert tasks — designed to genuinely challenge frontier models
+# Additional hard tasks — one per domain, each built around a classic pattern
 # ---------------------------------------------------------------------------
 
 EXPERT_TASKS = [
@@ -985,7 +999,7 @@ EXPERT_TASKS = [
         challenge_type="self_join",
     ),
 
-    # Temporal reasoning: readmission within 30 days (hospital)
+    # Repeat visits: patient-doctor pairs with several completed appointments (hospital)
     Task(
         id="hospital_hard_2",
         difficulty="hard",
@@ -1007,7 +1021,7 @@ EXPERT_TASKS = [
             ORDER BY visit_count DESC
         """,
         expected_columns=["patient_name", "doctor_name", "visit_count", "first_visit", "last_visit"],
-        description="Temporal analysis with GROUP BY HAVING on joined data",
+        description="Pairwise grouping with HAVING and MIN/MAX date range",
         hints=[
             "Join appointments with patients and doctors",
             "Group by patient-doctor pairs",
@@ -1018,7 +1032,7 @@ EXPERT_TASKS = [
         challenge_type="temporal_grouping",
     ),
 
-    # Multi-step: products in stock but never ordered (ecommerce)
+    # Anti-join: products in stock but never ordered (ecommerce)
     Task(
         id="ecommerce_hard_2",
         difficulty="hard",

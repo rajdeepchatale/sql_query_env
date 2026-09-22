@@ -1,23 +1,37 @@
 """
 Grading logic for SQL queries.
 
-I split the scoring into five isolated components instead of a standard binary pass/fail.
-I found during early local testing that if an agent referenced the correct tables but
-messed up an aggregate column name, binary scoring gave it zero signal, and it couldn't learn.
+Scoring is split into five components instead of binary pass/fail. With a
+binary reward, a query that references the right tables but gets one
+aggregate column wrong scores the same as garbage, which gives an agent no
+gradient to follow. Partial credit keeps the signal dense:
 
-Score weights were chosen through extensive trial and error on my end:
   syntax=0.10, tables=0.15, columns=0.20, results=0.45, efficiency=0.10
 
-I designed this so a query needs to be mostly correct to break 0.70, but the agent
-will always retain *some* partial progress.
+Result correctness dominates, so a query has to return mostly correct rows
+to score above ~0.70. A query only counts as *correct* (and ends the
+episode) when its rows match the reference result exactly.
+
+Agent queries run under a time and row budget against a read-only
+connection (see ``tasks.create_database``).
 """
 
 import re
 import sqlite3
+import time
+from collections import Counter
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Set, Tuple
 
 from .tasks import Task
+
+# Execution budget for a single agent query. The seed data is tiny, so any
+# legitimate query finishes in milliseconds; these limits only stop runaway
+# queries (e.g. an unbounded recursive CTE) from blocking a server worker.
+QUERY_TIMEOUT_S = 2.0
+MAX_RESULT_ROWS = 10_000
+_PROGRESS_INTERVAL = 10_000  # SQLite VM instructions between deadline checks
+_LIMIT_PREFIX = "Resource limit exceeded"
 
 
 # ---------------------------------------------------------------------------
@@ -27,7 +41,7 @@ from .tasks import Task
 @dataclass
 class Diagnostic:
     """Structured diagnostic for process supervision feedback."""
-    type: str       # e.g. MISSING_JOIN, WRONG_TABLE
+    type: str       # e.g. MISSING_JOIN, WRONG_TABLE_NAME
     severity: str   # error / warning / info
     message: str
     suggestion: str
@@ -59,6 +73,13 @@ class GradeResult:
     rows_expected: int
     diagnostics: List[Diagnostic] = field(default_factory=list)
     efficiency_notes: List[str] = field(default_factory=list)
+    # True when the returned rows match the reference result exactly and all
+    # expected columns are present. Independent of the efficiency score.
+    is_correct: bool = False
+
+
+class QueryLimitError(Exception):
+    """Raised when an agent query exceeds the time or row budget."""
 
 
 # ---------------------------------------------------------------------------
@@ -68,14 +89,16 @@ class GradeResult:
 def _extract_tables(query: str) -> Set[str]:
     """Pull table names out of FROM and JOIN clauses.
 
-    Quick regex approach — doesn't handle subquery aliases or CTEs but
-    it's good enough for our task set. Didn't want to pull in sqlparse
-    just for this.
+    Regex-based rather than a full parser: handles comma-separated FROM lists
+    and subqueries, but not CTE names. Good enough for the task set without
+    adding a dependency on sqlparse.
     """
     q = " ".join(query.lower().split())
     tables = set()
-    for match in re.finditer(r'\bfrom\s+(\w+)', q):
-        tables.add(match.group(1))
+    from_list = r'\bfrom\s+(\w+(?:\s+(?:as\s+)?\w+)?(?:\s*,\s*\w+(?:\s+(?:as\s+)?\w+)?)*)'
+    for match in re.finditer(from_list, q):
+        for item in match.group(1).split(","):
+            tables.add(item.split()[0])
     for match in re.finditer(r'\bjoin\s+(\w+)', q):
         tables.add(match.group(1))
     return tables
@@ -100,12 +123,15 @@ def _format_result(rows: List[Tuple], columns: List[str], max_rows: int = 20) ->
 
 
 def _is_destructive(query: str) -> bool:
-    """Check if query tries to modify data. We block everything except SELECT.
+    """Check whether a query tries to modify data or schema.
 
-    Double-checking here even though the environment also uses read-only
-    connections — better safe than sorry.
+    String literals and comments are stripped first so that e.g.
+    ``WHERE notes LIKE '%update%'`` is not flagged. This check only decides
+    the penalty; the read-only authorizer on the connection is what actually
+    prevents writes.
     """
-    q = query.upper().strip()
+    q = re.sub(r"'(?:[^']|'')*'", "''", query)
+    q = re.sub(r"--[^\n]*|/\*.*?\*/", " ", q, flags=re.DOTALL).upper()
     bad_keywords = ["DROP", "DELETE", "TRUNCATE", "ALTER", "UPDATE", "INSERT", "CREATE"]
     for kw in bad_keywords:
         if re.search(rf'\b{kw}\b', q):
@@ -113,32 +139,69 @@ def _is_destructive(query: str) -> bool:
     return False
 
 
+def _run_query(conn: sqlite3.Connection, query: str) -> Tuple[List[str], List[Tuple]]:
+    """Execute an agent query under the time and row budget.
+
+    Returns lower-cased column names and the fetched rows. Raises
+    ``QueryLimitError`` when a budget is exceeded and ``sqlite3.Error`` (or
+    ``ValueError`` for statements without a result set) otherwise.
+    """
+    deadline = time.monotonic() + QUERY_TIMEOUT_S
+    conn.set_progress_handler(lambda: time.monotonic() > deadline, _PROGRESS_INTERVAL)
+    cursor = None
+    try:
+        cursor = conn.execute(query)
+        if cursor.description is None:
+            raise ValueError("Query did not return a result set. Submit a SELECT statement.")
+        columns = [desc[0].lower() for desc in cursor.description]
+        rows = cursor.fetchmany(MAX_RESULT_ROWS + 1)
+    except sqlite3.OperationalError as e:
+        if str(e) == "interrupted":
+            raise QueryLimitError(
+                f"{_LIMIT_PREFIX}: query ran longer than {QUERY_TIMEOUT_S:g}s."
+            ) from e
+        raise
+    finally:
+        conn.set_progress_handler(None, 0)
+        if cursor is not None:
+            cursor.close()
+
+    if len(rows) > MAX_RESULT_ROWS:
+        raise QueryLimitError(f"{_LIMIT_PREFIX}: query returned more than {MAX_RESULT_ROWS} rows.")
+    return columns, rows
+
+
 def _normalize_value(v) -> str:
     """Normalize cell values for comparison.
 
-    Rounds floats to 2 decimal places so 3.1000001 matches 3.10.
+    Numbers are compared by value at 2 decimal places, so 3.1000001 matches
+    3.10 and an INTEGER 145000 matches a REAL 145000.0. Text is compared
+    case-insensitively.
     """
     if v is None:
         return "NULL"
-    if isinstance(v, float):
-        return f"{v:.2f}"
+    if isinstance(v, (int, float)):
+        return f"{float(v):.2f}"
     return str(v).strip().lower()
 
 
 def _compare_result_sets(
     actual_rows: List[Tuple],
     expected_rows: List[Tuple],
-    query: str = "",
     ground_truth_query: str = "",
-) -> float:
-    """Compare actual vs expected results, returns similarity 0-1.
+) -> Tuple[float, bool]:
+    """Compare actual vs expected rows.
 
-    Also checks row ordering if the ground truth has ORDER BY.
+    Returns ``(similarity, exact_match)``. Rows are compared as multisets, so
+    duplicated rows (e.g. from join fan-out) count against the query. Row
+    order does not affect an exact match: several reference queries sort on
+    keys with ties, where any tie order is equally valid. For partially
+    correct results, rows in the reference position earn a small bonus.
     """
     if not expected_rows:
-        return 1.0 if not actual_rows else 0.0
+        return (1.0, True) if not actual_rows else (0.0, False)
     if not actual_rows:
-        return 0.0
+        return 0.0, False
 
     def normalize_row(row: Tuple) -> Tuple[str, ...]:
         return tuple(_normalize_value(v) for v in row)
@@ -146,33 +209,33 @@ def _compare_result_sets(
     actual_norm = [normalize_row(r) for r in actual_rows]
     expected_norm = [normalize_row(r) for r in expected_rows]
 
-    actual_set = set(actual_norm)
-    expected_set = set(expected_norm)
+    actual_counts = Counter(actual_norm)
+    expected_counts = Counter(expected_norm)
+    if actual_counts == expected_counts:
+        return 1.0, True
 
-    matching = actual_set & expected_set
-    total_expected = len(expected_set)
-
-    if total_expected == 0:
-        return 1.0
+    matching = sum((actual_counts & expected_counts).values())
+    total_expected = len(expected_norm)
 
     # what fraction of expected rows did we get?
-    content_score = len(matching) / total_expected
+    content_score = matching / total_expected
 
     # dock points for extra rows the agent shouldn't have returned
-    extra = len(actual_set - expected_set)
+    extra = len(actual_norm) - matching
     if extra > 0:
         content_score = max(0.0, content_score - min(extra / total_expected * 0.3, 0.3))
 
-    # bonus for correct ordering when ORDER BY is expected
+    # small bonus for rows already in the right position when ORDER BY is expected
     order_bonus = 0.0
     has_order = "ORDER BY" in ground_truth_query.upper()
     if has_order and content_score > 0.5 and len(actual_norm) == len(expected_norm):
         correct_positions = sum(
-            1 for a, e in zip(actual_norm, expected_norm) if a == e
+            1 for a, e in zip(actual_norm, expected_norm, strict=True) if a == e
         )
         order_bonus = (correct_positions / len(expected_norm)) * 0.1
 
-    return min(content_score + order_bonus, 1.0)
+    # full credit is reserved for an exact match
+    return min(content_score + order_bonus, 0.95), False
 
 
 # ---------------------------------------------------------------------------
@@ -190,17 +253,20 @@ def _diagnose_query(
 ) -> List[Diagnostic]:
     """Figure out what went wrong and give actionable feedback.
 
-    We check for ~17 different issue types. The goal is process
-    supervision: give the agent enough info to fix its query on
-    the next attempt.
+    Covers execution errors (unknown table/column, ambiguous column,
+    disallowed statement, resource limits, syntax) and structural mismatches
+    against the reference query (missing tables, JOIN, GROUP BY, HAVING,
+    NULL handling, columns, row counts). The goal is process supervision:
+    give the agent enough information to fix its query on the next attempt.
     """
     diagnostics = []
     q_upper = query.upper()
     gt_upper = task.ground_truth_query.upper()
 
-    # -- syntax errors (parsed from SQLite error messages) --
+    # -- execution errors (parsed from SQLite error messages) --
     if error:
-        if "no such table" in error.lower():
+        err_lower = error.lower()
+        if "no such table" in err_lower:
             table_match = re.search(r'no such table: (\w+)', error, re.IGNORECASE)
             table_name = table_match.group(1) if table_match else "unknown"
             diagnostics.append(Diagnostic(
@@ -209,7 +275,7 @@ def _diagnose_query(
                 message=f"Table '{table_name}' does not exist in this database.",
                 suggestion="Check the schema description for available table names.",
             ))
-        elif "no such column" in error.lower():
+        elif "no such column" in err_lower:
             col_match = re.search(r'no such column: (\S+)', error, re.IGNORECASE)
             col_name = col_match.group(1) if col_match else "unknown"
             diagnostics.append(Diagnostic(
@@ -218,12 +284,26 @@ def _diagnose_query(
                 message=f"Column '{col_name}' does not exist.",
                 suggestion="Check the table definition for correct column names.",
             ))
-        elif "ambiguous column" in error.lower():
+        elif "ambiguous column" in err_lower:
             diagnostics.append(Diagnostic(
                 type="AMBIGUOUS_COLUMN",
                 severity="error",
                 message="A column name is ambiguous - it exists in multiple tables.",
                 suggestion="Use table aliases (e.g. e.name instead of just name).",
+            ))
+        elif "not authorized" in err_lower:
+            diagnostics.append(Diagnostic(
+                type="NOT_ALLOWED",
+                severity="error",
+                message="The database is read-only; this statement is not allowed.",
+                suggestion="Submit a single SELECT statement (WITH ... SELECT is fine).",
+            ))
+        elif error.startswith(_LIMIT_PREFIX):
+            diagnostics.append(Diagnostic(
+                type="RESOURCE_LIMIT",
+                severity="error",
+                message=error,
+                suggestion="Check for unbounded recursion or an accidental cross join.",
             ))
         else:
             diagnostics.append(Diagnostic(
@@ -243,8 +323,8 @@ def _diagnose_query(
         diagnostics.append(Diagnostic(
             type="MISSING_TABLE",
             severity="warning",
-            message=f"Your query doesn't reference: {', '.join(missing_tables)}",
-            suggestion=f"You probably need to JOIN with {', '.join(missing_tables)} to get the required data.",
+            message=f"Your query doesn't reference: {', '.join(sorted(missing_tables))}",
+            suggestion=f"You probably need to JOIN with {', '.join(sorted(missing_tables))} to get the required data.",
         ))
 
     if "JOIN" in gt_upper and "JOIN" not in q_upper:
@@ -280,7 +360,7 @@ def _diagnose_query(
         ))
 
     # -- result set checks --
-    missing_cols = set(expected_cols) - set(actual_cols)
+    missing_cols = sorted(set(expected_cols) - set(actual_cols))
     if missing_cols:
         diagnostics.append(Diagnostic(
             type="MISSING_COLUMNS",
@@ -289,7 +369,7 @@ def _diagnose_query(
             suggestion=f"Add these to your SELECT: {', '.join(missing_cols)}",
         ))
 
-    extra_cols = set(actual_cols) - set(expected_cols)
+    extra_cols = sorted(set(actual_cols) - set(expected_cols))
     if extra_cols:
         diagnostics.append(Diagnostic(
             type="EXTRA_COLUMNS",
@@ -303,7 +383,7 @@ def _diagnose_query(
             type="EXTRA_ROWS",
             severity="warning",
             message=f"Got {len(actual_rows)} rows but expected {len(expected_rows)}.",
-            suggestion="Your WHERE/HAVING conditions may be too broad. Try adding more filters.",
+            suggestion="Your WHERE/HAVING conditions may be too broad, or a JOIN is duplicating rows.",
         ))
     elif len(actual_rows) < len(expected_rows) and len(actual_rows) > 0:
         diagnostics.append(Diagnostic(
@@ -329,12 +409,14 @@ def _score_efficiency(
     """Score SQL best practices (0.0 - 0.10).
 
     Rewards good habits and penalizes bad ones. The weights are small
-    (max 0.10 total) so this doesn't dominate scoring, but it adds up
-    and teaches the agent to write cleaner SQL.
+    (max 0.10 total) so style never outweighs correctness. Bonuses that
+    depend on the task (COALESCE, DISTINCT) are judged against the reference
+    query, so they can't be farmed by adding the construct everywhere.
     """
     notes = []
     score = 0.0
     q_upper = query.upper().strip()
+    gt_upper = task.ground_truth_query.upper()
 
     # -- good practices --
     if re.search(r'\bAS\s+\w+', query, re.IGNORECASE):
@@ -342,7 +424,7 @@ def _score_efficiency(
         notes.append("Good: using column aliases (AS)")
 
     if "SELECT *" not in q_upper and len(expected_cols) > 0:
-        if set(actual_cols) == set(expected_cols) or set(actual_cols).issuperset(set(expected_cols)):
+        if set(actual_cols).issuperset(set(expected_cols)):
             score += 0.02
             notes.append("Good: selecting specific columns instead of SELECT *")
 
@@ -351,7 +433,8 @@ def _score_efficiency(
         score += 0.02
         notes.append("Good: using table aliases for readability")
 
-    if re.search(r'\bCOALESCE\b|\bIFNULL\b', query, re.IGNORECASE):
+    null_funcs = r'\bCOALESCE\b|\bIFNULL\b'
+    if re.search(null_funcs, query, re.IGNORECASE) and re.search(null_funcs, gt_upper):
         score += 0.03
         notes.append("Good: proper NULL handling with COALESCE/IFNULL")
 
@@ -360,7 +443,7 @@ def _score_efficiency(
         score -= 0.02
         notes.append("Avoid SELECT * when you only need specific columns")
 
-    if "DISTINCT" in q_upper and "DISTINCT" not in task.ground_truth_query.upper():
+    if "DISTINCT" in q_upper and "DISTINCT" not in gt_upper:
         score -= 0.01
         notes.append("DISTINCT may not be needed here - check if duplicates are actually expected")
 
@@ -378,6 +461,31 @@ def _score_efficiency(
 # Main grading function
 # ---------------------------------------------------------------------------
 
+def _failed_result(
+    penalty: float,
+    feedback_parts: List[str],
+    error: str,
+    diagnostics: List[Diagnostic],
+) -> GradeResult:
+    """Build the result for a query that was blocked or failed to execute."""
+    return GradeResult(
+        total_score=max(0.0, penalty),
+        syntax_score=0.0,
+        table_score=0.0,
+        column_score=0.0,
+        result_score=0.0,
+        efficiency_score=0.0,
+        penalty=penalty,
+        feedback="\n".join(feedback_parts),
+        query_result=None,
+        error=error,
+        rows_returned=0,
+        rows_expected=0,
+        diagnostics=diagnostics,
+        efficiency_notes=[],
+    )
+
+
 def grade_query(
     conn: sqlite3.Connection,
     query: str,
@@ -393,6 +501,8 @@ def grade_query(
       results:    0.45 (correct data returned)
       efficiency: 0.10 (query quality)
       penalties: -0.10 for destructive SQL, -0.05 for repeated queries
+
+    Destructive queries are rejected without being executed.
     """
     feedback_parts = []
     syntax_score = 0.0
@@ -402,14 +512,14 @@ def grade_query(
     efficiency_score = 0.0
     penalty = 0.0
     query_result_str = None
-    error_msg = None
     rows_returned = 0
     rows_expected = 0
     diagnostics = []
     efficiency_notes = []
 
     # check for destructive queries
-    if _is_destructive(query):
+    destructive = _is_destructive(query)
+    if destructive:
         penalty -= 0.10
         feedback_parts.append("PENALTY: Destructive SQL detected. Only SELECT statements are allowed.")
         diagnostics.append(Diagnostic(
@@ -433,13 +543,15 @@ def grade_query(
             ))
             break
 
+    if destructive:
+        return _failed_result(
+            penalty, feedback_parts,
+            "Blocked: only read-only SELECT statements are allowed.", diagnostics,
+        )
+
     # 1. Syntax check (0.10)
-    actual_rows = []
-    actual_cols = []
     try:
-        cursor = conn.execute(query)
-        actual_cols = [desc[0].lower() for desc in cursor.description] if cursor.description else []
-        actual_rows = cursor.fetchall()
+        actual_cols, actual_rows = _run_query(conn, query)
         rows_returned = len(actual_rows)
         syntax_score = 0.10
         feedback_parts.append("Query executed successfully.")
@@ -447,40 +559,15 @@ def grade_query(
     except Exception as e:
         error_msg = str(e)
         feedback_parts.append(f"SQL Error: {error_msg}")
-
-        diagnostics = _diagnose_query(
-            query, task, [], [], [], [], error_msg
-        )
-
-        total = max(0.0, penalty)
-        return GradeResult(
-            total_score=total,
-            syntax_score=0.0,
-            table_score=0.0,
-            column_score=0.0,
-            result_score=0.0,
-            efficiency_score=0.0,
-            penalty=penalty,
-            feedback="\n".join(feedback_parts),
-            query_result=None,
-            error=error_msg,
-            rows_returned=0,
-            rows_expected=0,
-            diagnostics=diagnostics,
-            efficiency_notes=[],
-        )
+        diagnostics.extend(_diagnose_query(query, task, [], [], [], [], error_msg))
+        return _failed_result(penalty, feedback_parts, error_msg, diagnostics)
 
     # get ground truth results
     try:
-        expected_cursor = conn.execute(task.ground_truth_query)
-        expected_rows = expected_cursor.fetchall()
-        expected_cols_from_query = [
-            desc[0].lower() for desc in expected_cursor.description
-        ] if expected_cursor.description else []
+        expected_rows = conn.execute(task.ground_truth_query).fetchall()
         rows_expected = len(expected_rows)
     except Exception:
         expected_rows = []
-        expected_cols_from_query = []
         rows_expected = 0
 
     # 2. Table references (0.15)
@@ -496,12 +583,13 @@ def grade_query(
             feedback_parts.append("Correct tables referenced.")
         elif table_ratio > 0:
             missing = expected_tables - actual_tables
-            feedback_parts.append(f"Partially correct tables. Missing: {', '.join(missing)}")
+            feedback_parts.append(f"Partially correct tables. Missing: {', '.join(sorted(missing))}")
         else:
-            feedback_parts.append(f"Wrong tables. Consider using: {', '.join(expected_tables)}")
+            feedback_parts.append(f"Wrong tables. Consider using: {', '.join(sorted(expected_tables))}")
 
     # 3. Column check (0.20)
     expected_cols_lower = [c.lower() for c in task.expected_columns]
+    col_ratio = 1.0
 
     if expected_cols_lower:
         matching_cols = set(actual_cols) & set(expected_cols_lower)
@@ -511,7 +599,7 @@ def grade_query(
         if col_ratio == 1.0:
             feedback_parts.append("Correct output columns.")
         elif col_ratio > 0:
-            missing_cols = set(expected_cols_lower) - set(actual_cols)
+            missing_cols = sorted(set(expected_cols_lower) - set(actual_cols))
             feedback_parts.append(f"Missing columns: {', '.join(missing_cols)}")
         else:
             feedback_parts.append(
@@ -519,12 +607,12 @@ def grade_query(
             )
 
     # 4. Result set comparison (0.45)
-    similarity = _compare_result_sets(
-        actual_rows, expected_rows, query, task.ground_truth_query
+    similarity, exact_match = _compare_result_sets(
+        actual_rows, expected_rows, task.ground_truth_query
     )
     result_score = 0.45 * similarity
 
-    if similarity == 1.0:
+    if exact_match:
         feedback_parts.append("Perfect result set - all rows match.")
     elif similarity > 0.5:
         feedback_parts.append(
@@ -547,10 +635,10 @@ def grade_query(
     )
 
     # generate diagnostics
-    diagnostics = _diagnose_query(
+    diagnostics.extend(_diagnose_query(
         query, task, actual_rows, expected_rows,
         actual_cols, expected_cols_lower, None,
-    )
+    ))
 
     # compute final score
     total = syntax_score + table_score + column_score + result_score + efficiency_score + penalty
@@ -584,9 +672,10 @@ def grade_query(
         penalty=penalty,
         feedback="\n".join(feedback_parts),
         query_result=query_result_str,
-        error=error_msg,
+        error=None,
         rows_returned=rows_returned,
         rows_expected=rows_expected,
         diagnostics=diagnostics,
         efficiency_notes=efficiency_notes,
+        is_correct=exact_match and col_ratio == 1.0,
     )

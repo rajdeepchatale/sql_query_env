@@ -1,6 +1,6 @@
 # Contributing
 
-Issues and pull requests are welcome. This guide covers local setup, the test suite, and how to add a task.
+Issues and pull requests are welcome. This guide covers local setup, the test suite, adding a task, and deployment.
 
 ## Setup
 
@@ -49,6 +49,31 @@ The test suite checks:
 5. Run `uv run pytest -q`. The consistency tests fail if you skipped step 3 or 4.
 
 When the reference query sorts on a key that can tie, keep in mind that any tie order counts as correct. Row order is not part of the correctness check.
+
+## Deploying to Hugging Face Spaces
+
+The live Space runs the root `Dockerfile`. Deploy with the OpenEnv CLI:
+
+```bash
+uv run openenv push
+```
+
+Hugging Face reads a Space's settings from a YAML header at the top of its `README.md`. The header is kept out of this repository's README because GitHub renders it as a table. `openenv push` adds a generic header automatically. To keep the project's name and description on the Space, put this block at the very top of the Space's `README.md`:
+
+```yaml
+---
+title: SQL Query
+emoji: 📊
+colorFrom: blue
+colorTo: indigo
+sdk: docker
+app_port: 8000
+pinned: false
+short_description: Text-to-SQL RL environment with execution-based rewards
+tags:
+  - openenv
+---
+```
 
 ## Things to know
 
